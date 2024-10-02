@@ -1718,6 +1718,7 @@ void ov::npuw::util::to_f16(ov::Tensor& t) {
     NPUW_ASSERT(t.get_size() % 8 == 0);
     NPUW_ASSERT(t.is_continuous());
 
+#if defined(HAVE_AVX2)
     ov::Tensor tnew(ov::element::f16, shape);
 
     const float* psrc = t.data<float>();
@@ -1733,6 +1734,9 @@ void ov::npuw::util::to_f16(ov::Tensor& t) {
     }
 
     t = std::move(tnew);
+#else
+    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+#endif
 }
 
 inline uint8_t tread_4b(const ov::Tensor& t, std::size_t r, std::size_t c, std::size_t COLS) {
