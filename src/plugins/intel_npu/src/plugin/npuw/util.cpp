@@ -65,7 +65,7 @@ std::string ov::npuw::util::fmt(std::size_t number, std::size_t total) {
 }
 
 namespace {
-
+#if defined(HAVE_AVX2)
 inline int8_t hi4(int8_t x) {
     return ((x & (1 << 7)) >> 4) | ((x & (1 << 6)) >> 4) | ((x & (1 << 5)) >> 4) | ((x & (1 << 4)) >> 4);
 }
@@ -73,6 +73,7 @@ inline int8_t hi4(int8_t x) {
 inline int8_t lo4(int8_t x) {
     return (x & (1 << 3)) | (x & (1 << 2)) | (x & (1 << 1)) | (x & (1 << 0));
 }
+#endif
 
 inline uint8_t hi4(uint8_t x) {
     return x >> 4;
@@ -82,11 +83,11 @@ inline uint8_t lo4(uint8_t x) {
     return x & 0xF;
 }
 
+#if defined(HAVE_AVX2)
 inline int8_t upc(int8_t h) {
     return h | (-((h & (1 << 3)) >> 3) & (-8));
 }
 
-#if defined(HAVE_AVX2)
 // NOTE: This routine implements the NEW ORDER
 #    define avx2_i4toi8(vinput, vout0, vout1)                                         \
         {                                                                             \
