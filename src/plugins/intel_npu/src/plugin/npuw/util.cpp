@@ -362,7 +362,7 @@ void unpack_i4i8(const ov::SoPtr<ov::ITensor>& from,
     }
     UNPACK_SAVE_TICK();
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -502,7 +502,7 @@ void unpack_i4f16(const ov::SoPtr<ov::ITensor>& from,
         }
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -659,7 +659,7 @@ void unpack_i4f16(const ov::SoPtr<ov::ITensor>& from,
         }
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -836,7 +836,7 @@ void unpack_u4f16(const ov::SoPtr<ov::ITensor>& from,
         pDst += 64;  // note pDst is int16_t
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1017,7 +1017,7 @@ void unpack_u4f16(const ov::SoPtr<ov::ITensor>& from,
         }
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1201,7 +1201,7 @@ void unpack_u4f16_asymm_zp(const ov::SoPtr<ov::ITensor>& from,
         }
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1302,7 +1302,7 @@ void unpack_u4f16_z(const ov::SoPtr<ov::ITensor>& from,
         }
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1350,7 +1350,7 @@ void unpack_i8f16(const ov::SoPtr<ov::ITensor>& from,
         pDst += 8;
     }
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1392,7 +1392,7 @@ void unpack_i8f16(const ov::SoPtr<ov::ITensor>& from,
         pScl += scale_elem_type.size();
     }  // sindex
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
@@ -1446,13 +1446,13 @@ void unpack_u8f16(const ov::SoPtr<ov::ITensor>& from,
         pZrp++;
     }  // sindex
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 
 }  // namespace
 
-void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
+void ov::npuw::util::unpack_impl(const ov::SoPtr<ov::ITensor>& from,
                             const ov::SoPtr<ov::ITensor>& to,
                             const UnpackOptions& unpack_options) {
     // This is in fact a weight decompression procedure
@@ -1481,7 +1481,7 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
 #undef CAST
 }
 
-void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
+void ov::npuw::util::unpack1_impl(const ov::SoPtr<ov::ITensor>& from,
                             const ov::SoPtr<ov::ITensor>& scale,
                             const ov::SoPtr<ov::ITensor>& to,
                             const UnpackOptions& unpack_options) {
@@ -1511,7 +1511,7 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
     }
 }
 
-void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
+void ov::npuw::util::unpack2_impl(const ov::SoPtr<ov::ITensor>& from,
                             const ov::SoPtr<ov::ITensor>& zerop,
                             const ov::SoPtr<ov::ITensor>& scale,
                             const ov::SoPtr<ov::ITensor>& to,
@@ -1717,7 +1717,7 @@ void ov::npuw::util::to_f32(const ov::Tensor& in, ov::Tensor& out) {
     }
 }
 
-void ov::npuw::util::to_f16(ov::Tensor& t) {
+void ov::npuw::util::to_f16_impl(ov::Tensor& t) {
     ov::Shape shape = t.get_shape();
     NPUW_ASSERT(t.get_element_type() == ov::element::f32);
     NPUW_ASSERT(t.get_size() % 8 == 0);
@@ -1740,7 +1740,7 @@ void ov::npuw::util::to_f16(ov::Tensor& t) {
 
     t = std::move(tnew);
 #else
-    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+    NPUW_ASSERT("AVX2 support is neccessary but it's not enabled!");
 #endif
 }
 

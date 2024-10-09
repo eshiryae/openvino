@@ -8,6 +8,7 @@
 
 #include "../logging.hpp"
 #include "../util.hpp"
+#include "../util_xarch.hpp"
 #include "intel_npu/al/config/npuw.hpp"
 #include "online/compiler.hpp"
 #include "online/utils/utils.hpp"  // getMetaDesc
@@ -1750,7 +1751,7 @@ void Partitioner::optimize(const std::string& func_name) {
             auto closure_idx = param_idx - f._param_offset;
             ov::parallel_for(func_group.refs.size(), [&](std::size_t f_idx) {
                 auto& funcall = func_group.refs[f_idx].get();
-                ov::npuw::util::to_f16(funcall._closure[closure_idx]);
+                ov::npuw::util::XARCH::to_f16(funcall._closure[closure_idx]);
             });
         }
     };
@@ -1837,9 +1838,9 @@ void Partitioner::optimize(const std::string& func_name) {
 
                 const auto& gti = ov::get_tensor_impl;
                 if (cw && cz && cs) {
-                    ov::npuw::util::unpack(gti(cw), gti(cz), gti(cs), gti(dst));
+                    ov::npuw::util::XARCH::unpack2(gti(cw), gti(cz), gti(cs), gti(dst));
                 } else if (cw && cs) {
-                    ov::npuw::util::unpack(gti(cw), gti(cs), gti(dst));
+                    ov::npuw::util::XARCH::unpack1(gti(cw), gti(cs), gti(dst));
                 } else {
                     NPUW_ASSERT(false && "Unsupported combination");
                 }
