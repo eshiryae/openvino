@@ -684,6 +684,7 @@ void unpack_i4f16_z(const ov::SoPtr<ov::ITensor>& from,
     const auto scale_elem_type = scale->get_element_type();
     NPUW_ASSERT(scale_elem_type == ov::element::f32);
 
+#if defined(HAVE_AVX2)
     // This conversion combines i4tof32 and f32tof16. Here we
     // - read    256  bits (= 32  bytes, = 64  u4  elements)
     // - write   1024 bits (= 128 bytes, = 64  f16 elements)
@@ -770,6 +771,9 @@ void unpack_i4f16_z(const ov::SoPtr<ov::ITensor>& from,
             unpack_body(job_index, stride);
         }
     }
+#else
+    throw std::runtime_error("AVX2 support is neccessary but it's not enabled!");
+#endif
 }
 
 void unpack_u4f16(const ov::SoPtr<ov::ITensor>& from,
