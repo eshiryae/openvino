@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#if defined(HAVE_AVX2)
+#    include <immintrin.h>
+#endif
+
 #include "util_xarch.hpp"
-#include "util.hpp"
+#include "unpack_kernel.hpp"
 
 void ov::npuw::util::XARCH::unpack(const ov::SoPtr<ov::ITensor>& from,
             const ov::SoPtr<ov::ITensor>& to) {

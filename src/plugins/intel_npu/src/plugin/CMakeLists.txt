@@ -66,8 +66,6 @@ target_include_directories(${TARGET_NAME}
         $<TARGET_PROPERTY:LevelZero::NPUExt,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
-
-
 cross_compiled_file(${TARGET_NAME}
         ARCH AVX2 ANY
                     npuw/util_xarch.cpp

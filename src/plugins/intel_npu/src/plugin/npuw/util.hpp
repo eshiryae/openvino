@@ -24,31 +24,6 @@ bool starts_with(const std::string& str, const std::string& prefix);
 
 std::string fmt(std::size_t number, std::size_t total);
 
-struct UnpackOptions {
-    bool bUseOvParallelFor;
-    size_t nPartitions;  // if 0 we use 64 elements step in parallel for, otherwise  target workload is dynamically
-                         // calculated
-    bool bStrictPartitioning;  // cannot reduce partitions in favor of speed
-    explicit UnpackOptions(bool useParallelFor, size_t nPartitions, bool bStrictPartitioning)
-        : bUseOvParallelFor(useParallelFor),
-          nPartitions(nPartitions),
-          bStrictPartitioning(bStrictPartitioning) {}
-};
-
-void unpack_impl(const ov::SoPtr<ov::ITensor>& from,
-            const ov::SoPtr<ov::ITensor>& to,
-            const UnpackOptions& unpack_options = UnpackOptions{true, 16, false});
-
-void unpack1_impl(const ov::SoPtr<ov::ITensor>& from,
-            const ov::SoPtr<ov::ITensor>& scale,
-            const ov::SoPtr<ov::ITensor>& to,
-            const UnpackOptions& unpack_options = UnpackOptions{true, 16, false});
-
-void unpack2_impl(const ov::SoPtr<ov::ITensor>& from,
-            const ov::SoPtr<ov::ITensor>& zerop,
-            const ov::SoPtr<ov::ITensor>& scale,
-            const ov::SoPtr<ov::ITensor>& to,
-            const UnpackOptions& unpack_options = UnpackOptions{true, 16, false});
 
 void gather(const ov::SoPtr<ov::ITensor>& src, const ov::SoPtr<ov::ITensor>& idx, const ov::SoPtr<ov::ITensor>& dst);
 
@@ -58,7 +33,6 @@ ov::SoPtr<ov::ITensor> view(const ov::SoPtr<ov::ITensor>& src, const View& from,
 ov::SoPtr<ov::ITensor> view(const ov::SoPtr<ov::ITensor>& src, std::size_t dim, std::size_t offset, std::size_t len);
 
 void to_f32(const ov::Tensor& in, ov::Tensor& out);
-void to_f16_impl(ov::Tensor& t);
 void transpose(ov::Tensor& t);
 void permute(ov::Tensor& t, const std::vector<std::size_t>& axes);
 ov::Tensor concat(const std::vector<ov::Tensor>& tt, std::size_t axis);
