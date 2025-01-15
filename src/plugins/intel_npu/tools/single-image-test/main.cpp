@@ -1819,7 +1819,7 @@ static ov::Shape parseDataShape(const std::string& dataShapeStr) {
 static int runSingleImageTest() {
     std::cout << "Run single image test" << std::endl;
     try {
-        const std::unordered_set<std::string> allowedPrecision = {"U8", "I32", "I64", "FP16", "FP32"};
+        const std::unordered_set<std::string> allowedPrecision = {"U8", "I32", "I64", "FP16", "FP32", "NF4"};
         if (!FLAGS_ip.empty()) {
             // input precision is U8, I32, I64, FP16 or FP32 only
             std::transform(FLAGS_ip.begin(), FLAGS_ip.end(), FLAGS_ip.begin(), ::toupper);
@@ -1880,6 +1880,8 @@ static int runSingleImageTest() {
                         inputBinPrecisionForOneInfer[inferIdx][precisionIdx] = ov::element::i64;
                     } else if (strEq(precision, "U8")) {
                         inputBinPrecisionForOneInfer[inferIdx][precisionIdx] = ov::element::u8;
+                    } else if (strEq(precision, "NF4")) {
+                        inputBinPrecisionForOneInfer[inferIdx][precisionIdx] = ov::element::nf4;
                     } else {
                         std::cout << "WARNING: Unhandled precision '" << precision
                                   << "'! Only FP32, FP16, I32, I64 and U8 can be currently converted to the network's"
@@ -1929,6 +1931,8 @@ static int runSingleImageTest() {
                     prc_in = ov::element::i32;
                 else if (FLAGS_ip == "I64")
                     prc_in = ov::element::i64;
+                else if (FLAGS_ip == "NF4")
+                    prc_in = ov::element::nf4;
                 else
                     prc_in = ov::element::u8;
 
@@ -1990,6 +1994,8 @@ static int runSingleImageTest() {
                     prc_out = ov::element::i32;
                 else if (FLAGS_op == "I64")
                     prc_out = ov::element::i64;
+                else if (FLAGS_op == "NF4")
+                    prc_out = ov::element::nf4;
                 else
                     prc_out = ov::element::u8;
 
