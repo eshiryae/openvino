@@ -139,14 +139,18 @@ ov::npuw::patterns::pre_compute::LongRopePatternPhi::LongRopePatternPhi() : matc
         auto red_max = opp::wrap_type<ov::op::v1::ReduceMax>({position_ids, MakeConstant()});
         auto add = opp::wrap_type<ov::op::v1::Add>({red_max, MakeConstant()});
         // max(position_ids) + 1 <= original_max_position_embeddings
-        auto leq = opp::wrap_type<ov::op::v1::LessEqual>({add, MakeConstant()});
+        // auto leq = opp::wrap_type<ov::op::v1::LessEqual>({add, MakeConstant()});
+        auto leq = opp::wrap_type<ov::op::v1::Greater>({add, MakeConstant()});
 
         auto inv_freq_short_conv = opp::optional<ov::op::v0::Convert>({inv_freq_short->output(0)});
         auto inv_freq_long_conv = opp::optional<ov::op::v0::Convert>({inv_freq_long->output(0)});
 
         // max(position_ids) + 1 <= original_max_position_embeddings ? short_factor : long_factor;
         auto select = opp::wrap_type<ov::op::v1::Select>({leq, inv_freq_short_conv, inv_freq_long_conv});
-        auto unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({select, MakeConstant()});
+        auto multiply = opp::wrap_type<ov::op::v1::Multiply>({select, MakeConstant()});
+        auto power = opp::wrap_type<ov::op::v1::Power>({multiply, MakeConstant()});
+        auto unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({power, MakeConstant()});
+        // auto unsqueeze = opp::optional<ov::op::v0::Unsqueeze>({select, MakeConstant()});
         auto unsqueeze_1 = opp::optional<ov::op::v0::Unsqueeze>({unsqueeze, MakeConstant()});
 
         return std::make_tuple(unsqueeze_1, leq, red_max);
