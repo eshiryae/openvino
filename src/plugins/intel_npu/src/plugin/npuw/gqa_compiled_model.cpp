@@ -262,6 +262,7 @@ std::pair<ov::AnyMap, GQAModelStage> with_gqa_defaults(const std::shared_ptr<ov:
     // LLM-only option; the inner CompiledModel only registers ROOT options.
     config.erase(std::string(::intel_npu::NPUW_LLM_MAX_CONTEXT_LEN::key()));
     config.erase(std::string(::intel_npu::NPUW_LLM_SWA_LEN::key()));
+    config.erase(std::string(::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE::key()));
     return {config, stage};
 }
 
@@ -327,8 +328,34 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
         dynamic_kv_cache_axes = reshape_to_static_gqa.dynamic_kv_cache_axes();
     }
 
+    std::shared_ptr<ov::Model> short_chunk_model;
+    const auto chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
+    if (stage == GQAModelStage::PREFILL && chunk_size > 0) {
+        auto input_ids = std::find_if(model->get_parameters().begin(),
+                                      model->get_parameters().end(),
+                                      [](const auto& parameter) { return parameter->get_friendly_name() == "input_ids"; });
+        if (input_ids != model->get_parameters().end()) {
+            auto ids_shape = (*input_ids)->get_partial_shape();
+            OPENVINO_ASSERT(ids_shape.rank().is_static() && ids_shape.size() >= 2,
+                            "GQA input_ids must have a static rank of at least 2 for short-chunk compilation");
+            if (ids_shape[1].is_dynamic() || static_cast<uint64_t>(ids_shape[1].get_length()) > chunk_size) {
+                short_chunk_model = model->clone();
+                if (has_dynamic_max_seq_len(short_chunk_model)) {
+                    const size_t max_seq_len = gqa_ctx_len_env_override().value_or(
+                        cfg_get<::intel_npu::NPUW_LLM_MAX_CONTEXT_LEN>(properties));
+                    ov::npuw::ReshapeToStaticGQA reshape_to_static_gqa(max_seq_len);
+                    reshape_to_static_gqa.run_on_model(short_chunk_model);
+                }
+                const auto input_index = static_cast<size_t>(std::distance(model->get_parameters().begin(), input_ids));
+                ids_shape[1] = ov::Dimension(static_cast<int64_t>(chunk_size));
+                short_chunk_model->reshape({{short_chunk_model->get_parameters()[input_index]->output(0), ids_shape}});
+            }
+        }
+    }
+
     return {model,
             compiled_model,
+            short_chunk_model
             std::move(prepared_properties),
             std::move(dynamic_kv_cache_axes),
             effective_max_context_len,
@@ -563,6 +590,11 @@ ov::npuw::GQACompiledModel::GQACompiledModel(PreparedState prepared,
       m_effective_max_context_len(prepared.effective_max_context_len),
       m_effective_sliding_window_capacity(prepared.effective_sliding_window_capacity) {
     OPENVINO_ASSERT(m_inner_compiled_model != nullptr, "GQACompiledModel requires a valid inner compiled model");
+    if (prepared.short_chunk_model) {
+        m_short_chunk_compiled_model = factory(prepared.short_chunk_model, plugin, prepared.properties);
+        OPENVINO_ASSERT(m_short_chunk_compiled_model != nullptr,
+                        "GQACompiledModel requires a valid short-chunk compiled model");
+    }
     m_dynamic_kv_cache_output_axes = find_dynamic_kv_cache_output_axes(outputs());
     m_total_seq_len_param_name = find_total_sequence_length_param_name(m_outer_model);
     m_present_to_past_param_names = find_present_to_past_param_names(m_outer_model);
@@ -573,6 +605,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(PreparedState prepared,
 ov::npuw::GQACompiledModel::GQACompiledModel(const std::shared_ptr<ov::Model>& outer_model,
                                              const std::shared_ptr<const ov::IPlugin>& plugin,
                                              std::shared_ptr<ov::npuw::ICompiledModel> inner_compiled_model,
+                                             std::shared_ptr<ov::npuw::ICompiledModel> short_chunk_compiled_model,
                                              std::unordered_map<std::string, size_t> dynamic_kv_cache_axes,
                                              uint32_t effective_max_context_len,
                                              uint32_t effective_sliding_window_capacity,
@@ -585,6 +618,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(const std::shared_ptr<ov::Model>& o
       m_effective_max_context_len(effective_max_context_len),
       m_effective_sliding_window_capacity(effective_sliding_window_capacity) {
     OPENVINO_ASSERT(m_inner_compiled_model != nullptr, "GQACompiledModel requires a valid inner compiled model");
+    m_short_chunk_compiled_model = std::move(short_chunk_compiled_model);
     m_dynamic_kv_cache_output_axes = find_dynamic_kv_cache_output_axes(outputs());
     // NOT re-derived via find_total_sequence_length_param_name()/find_present_to_past_param_names()
     // here: outer_model on this (import) path is a dummy carcass with no real GQA ops, so
@@ -698,6 +732,10 @@ void ov::npuw::GQACompiledModel::export_model(std::ostream& stream) const {
               << ", present_to_past_param_names has " << m_present_to_past_param_names.size() << " entries"
               << "; delegating to inner m_inner_compiled_model->export_model()");
     m_inner_compiled_model->export_model(stream);
+    stream.put(m_short_chunk_compiled_model ? '1' : '0');
+    if (m_short_chunk_compiled_model) {
+        m_short_chunk_compiled_model->export_model(stream);
+    }
     LOG_INFO("Done");
     GQA_TRACE("GQACompiledModel::export_model() done");
 }
@@ -742,8 +780,20 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
         std::make_shared<ov::Model>(ov::as_output_vector(outer_results), outer_parameters, "gqa_outer_model");
 
     // The rest of the stream is the self-contained inner CompiledModel ORC blob.
-    auto inner_compiled_model = ov::npuw::CompiledModel::import_model(stream, plugin, properties);
+    auto inner_properties = properties;
+    inner_properties.erase(std::string(::intel_npu::NPUW_LLM_MAX_CONTEXT_LEN::key()));
+    inner_properties.erase(std::string(::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE::key()));
+    auto inner_compiled_model = ov::npuw::CompiledModel::import_model(stream, plugin, inner_properties);
     NPUW_ASSERT(inner_compiled_model != nullptr);
+    std::shared_ptr<ov::npuw::ICompiledModel> short_chunk_compiled_model;
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        const auto marker = static_cast<char>(stream.get());
+        OPENVINO_ASSERT(marker == '0' || marker == '1', "GQACompiledModel: invalid short-chunk model marker");
+        if (marker == '1') {
+            short_chunk_compiled_model = ov::npuw::CompiledModel::import_model(stream, plugin, inner_properties);
+            NPUW_ASSERT(short_chunk_compiled_model != nullptr);
+        }
+    }
     GQA_TRACE("    inner CompiledModel imported @ "
               << inner_compiled_model.get()
               << "; wrapping it back into a GQACompiledModel so dynamic KV-cache/attention-bias reshape "
@@ -752,6 +802,7 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
     return std::shared_ptr<GQACompiledModel>(new GQACompiledModel(outer_model,
                                                                   plugin,
                                                                   std::move(inner_compiled_model),
+                                                                  std::move(short_chunk_compiled_model),
                                                                   std::move(dynamic_kv_cache_axes),
                                                                   effective_max_context_len,
                                                                   effective_sliding_window_capacity,
@@ -765,6 +816,9 @@ std::shared_ptr<const ov::Model> ov::npuw::GQACompiledModel::get_runtime_model()
 
 void ov::npuw::GQACompiledModel::set_property(const ov::AnyMap& properties) {
     m_inner_compiled_model->set_property(properties);
+    if (m_short_chunk_compiled_model) {
+        m_short_chunk_compiled_model->set_property(properties);
+    }
 }
 
 ov::Any ov::npuw::GQACompiledModel::get_property(const std::string& name) const {
@@ -796,36 +850,103 @@ ov::npuw::GQAInferRequest::GQAInferRequest(std::shared_ptr<const GQACompiledMode
 }
 
 void ov::npuw::GQAInferRequest::ensure_inner_request_locked() const {
-    if (m_inner_request == nullptr) {
-        m_inner_request = m_compiled_model->m_inner_compiled_model->create_infer_request();
-        OPENVINO_ASSERT(m_inner_request != nullptr, "GQA infer request requires a valid inner request");
-        const auto& inner_model = m_compiled_model->m_inner_compiled_model;
-        GQA_TRACE("ensure_inner_request_locked(): created inner infer request @ "
-                  << m_inner_request.get() << ", inner model has " << inner_model->inputs().size() << " inputs, "
-                  << inner_model->outputs().size() << " outputs");
-
-        // Zero-initialize every dynamic-axis KV-cache/bias input's full capacity, once.
-        [[maybe_unused]] size_t zeroed_count = 0;  // only read by the developer-build GQA_TRACE below
-        for (const auto& kv : m_compiled_model->m_dynamic_kv_cache_axes) {
-            // Pre-C++20: structured bindings can't be captured by lambdas, so use a named local.
-            const auto& name = kv.first;
-            auto input_it = std::find_if(inner_model->inputs().begin(),
-                                         inner_model->inputs().end(),
-                                         [&name](const ov::Output<const ov::Node>& input) {
-                                             return input.get_node()->get_friendly_name() == name;
-                                         });
-            if (input_it == inner_model->inputs().end()) {
-                continue;
-            }
-            auto tensor = m_inner_request->get_tensor(*input_it);
-            if (!tensor || tensor->get_byte_size() == 0) {
-                continue;
-            }
-            std::memset(tensor->data(), 0, tensor->get_byte_size());
-            ++zeroed_count;
-        }
-        GQA_TRACE("ensure_inner_request_locked(): zero-initialized " << zeroed_count << " dynamic-axis input(s)");
+    if (m_regular_inner_request == nullptr) {
+        m_regular_inner_request = create_inner_request_locked(m_compiled_model->m_inner_compiled_model);
     }
+    if (m_inner_request == nullptr) {
+        m_inner_request = m_regular_inner_request;
+    }
+}
+
+std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::GQAInferRequest::create_inner_request_locked(
+    const std::shared_ptr<ov::npuw::ICompiledModel>& compiled_model) const {
+    auto request = compiled_model->create_infer_request();
+    OPENVINO_ASSERT(request != nullptr, "GQA infer request requires a valid inner request");
+    // Zero-initialize every dynamic-axis KV-cache/bias input's full capacity, once.
+    [[maybe_unused]] size_t zeroed_count = 0;  // only read by the developer-build GQA_TRACE below
+    for (const auto& kv : m_compiled_model->m_dynamic_kv_cache_axes) {
+        // Pre-C++20: structured bindings can't be captured by lambdas, so use a named local.
+        const auto& name = kv.first;
+        auto input_it = std::find_if(inner_model->inputs().begin(),
+                                     inner_model->inputs().end(),
+                                     [&name](const ov::Output<const ov::Node>& input) {
+                                         return input.get_node()->get_friendly_name() == name;
+                                     });
+        if (input_it == inner_model->inputs().end()) {
+            continue;
+        }
+        auto tensor = request->get_tensor(*input_it);
+        if (!tensor || tensor->get_byte_size() == 0) {
+            continue;
+        }
+        std::memset(tensor->data(), 0, tensor->get_byte_size());
+        ++zeroed_count;
+    }
+    GQA_TRACE("create_inner_request_locked(): created request @ " << request.get() << " with " << zeroed_count
+                                                                  << " zero-initialized dynamic-axis input(s)");
+    return request;
+}
+
+void ov::npuw::GQAInferRequest::select_inner_request_locked() const {
+    ensure_inner_request_locked();
+    auto selected_request = m_regular_inner_request;
+    if (m_compiled_model->m_short_chunk_compiled_model) {
+        const auto ids_it = m_user_input_tensors.find("input_ids");
+        if (ids_it != m_user_input_tensors.end()) {
+            const auto& ids_shape = ids_it->second->get_shape();
+            const auto& short_inputs = m_compiled_model->m_short_chunk_compiled_model->inputs();
+            auto short_ids = std::find_if(short_inputs.begin(), short_inputs.end(), [](const auto& input) {
+                return input.get_node()->get_friendly_name() == "input_ids";
+            });
+            if (short_ids != short_inputs.end() && ids_shape.size() > 1 &&
+                (*short_ids).get_partial_shape().rank().is_static() &&
+                (*short_ids).get_partial_shape().size() > 1 && (*short_ids).get_partial_shape()[1].is_static() &&
+                ids_shape[1] == static_cast<size_t>((*short_ids).get_partial_shape()[1].get_length())) {
+                if (m_short_chunk_inner_request == nullptr) {
+                    m_short_chunk_inner_request =
+                        create_inner_request_locked(m_compiled_model->m_short_chunk_compiled_model);
+                }
+                selected_request = m_short_chunk_inner_request;
+            }
+        }
+    }
+    if (selected_request == m_inner_request) {
+        return;
+    }
+
+    m_inner_request = std::move(selected_request);
+    const auto& outer_inputs = m_compiled_model->inputs();
+    const auto& inner_inputs = m_inner_request->get_compiled_model()->inputs();
+    OPENVINO_ASSERT(outer_inputs.size() == inner_inputs.size(), "GQA inner model input count mismatch");
+    for (size_t i = 0; i < outer_inputs.size(); ++i) {
+        const auto& name = outer_inputs[i].get_node()->get_friendly_name();
+        if (m_compiled_model->m_dynamic_kv_cache_axes.count(name) != 0) {
+            continue;
+        }
+        auto tensor_it = m_user_input_tensors.find(name);
+        if (tensor_it != m_user_input_tensors.end()) {
+            m_inner_request->set_tensor(inner_inputs[i], tensor_it->second);
+        }
+    }
+
+    for (const auto& [name, axis] : m_compiled_model->m_dynamic_kv_cache_axes) {
+        auto tensor_it = m_dynamic_kv_cache_tensors.find(name);
+        if (tensor_it == m_dynamic_kv_cache_tensors.end()) {
+            continue;
+        }
+        auto input_it = std::find_if(outer_inputs.begin(), outer_inputs.end(), [&name](const auto& input) {
+            return input.get_node()->get_friendly_name() == name;
+        });
+        if (input_it == outer_inputs.end()) {
+            continue;
+        }
+        const auto input_index = static_cast<size_t>(std::distance(outer_inputs.begin(), input_it));
+        const auto& destination = m_inner_request->get_tensor(inner_inputs[input_index]);
+        if (tensor_it->second->get_shape().at(axis) == destination->get_shape().at(axis)) {
+            m_inner_request->set_tensor(inner_inputs[input_index], tensor_it->second);
+        }
+    }
+    GQA_TRACE("select_inner_request_locked(): selected request @ " << m_inner_request.get());
 }
 
 // FIXME: Online search every time; a static mapping could be built once.
@@ -906,7 +1027,7 @@ void ov::npuw::GQAInferRequest::trace_attention_mask_stats_locked() const {
 
 void ov::npuw::GQAInferRequest::infer() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    ensure_inner_request_locked();
+    select_inner_request_locked();
     sync_dynamic_kv_cache_tensors_locked();
     trace_sequence_length_inputs_locked();
     trace_attention_mask_stats_locked();
@@ -1188,7 +1309,11 @@ void ov::npuw::GQAInferRequest::set_tensor(const ov::Output<const ov::Node>& por
     const auto& dynamic_axes = m_compiled_model->m_dynamic_kv_cache_axes;
     auto it = dynamic_axes.find(name);
     if (it == dynamic_axes.end()) {
-        GQA_TRACE("    -> not a dynamic-axis input, forwarding to inner request as-is");
+        m_user_input_tensors[name] = tensor;
+        if (name == "input_ids") {
+            select_inner_request_locked();
+        }
+        GQA_TRACE("    -> not a dynamic-axis input, forwarding to selected inner request");
         m_inner_request->set_tensor(map_port_locked(port), tensor);
         return;
     }

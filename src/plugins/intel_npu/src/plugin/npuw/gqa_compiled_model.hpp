@@ -40,12 +40,20 @@ public:
 
 private:
     void ensure_inner_request_locked() const;
+    void select_inner_request_locked() const;
+    std::shared_ptr<ov::IAsyncInferRequest> create_inner_request_locked(
+        const std::shared_ptr<ov::npuw::ICompiledModel>& compiled_model) const;
     const ov::Output<const ov::Node>& map_port_locked(const ov::Output<const ov::Node>& port) const;
 
     std::shared_ptr<const GQACompiledModel> m_compiled_model;
     mutable std::mutex m_mutex;
     mutable std::shared_ptr<ov::IAsyncInferRequest> m_inner_request;
-    // Outer-facing tensor for dynamic KV-cache/attention-bias ports, keyed by port name.
+    mutable std::shared_ptr<ov::IAsyncInferRequest> m_regular_inner_request;
+    mutable std::shared_ptr<ov::IAsyncInferRequest> m_short_chunk_inner_request;
+    mutable std::unordered_map<std::string, ov::SoPtr<ov::ITensor>> m_user_input_tensors;
+    // Outer-facing tensor for dynamic KV-cache/attention-bias ports (see
+    // GQACompiledModel::m_dynamic_kv_cache_axes); only its valid prefix is copied into
+    // the inner request's static buffer. Keyed by port friendly name.
     mutable std::unordered_map<std::string, ov::SoPtr<ov::ITensor>> m_dynamic_kv_cache_tensors;
     // Dynamic-axis inputs currently bound directly onto the caller's exact-capacity
     // tensor; must be restored before a shorter set_tensor() reuses the port.
@@ -143,6 +151,7 @@ private:
     struct PreparedState {
         std::shared_ptr<ov::Model> model;
         std::shared_ptr<ov::Model> compiled_model;
+        std::shared_ptr<ov::Model> short_chunk_model;
         ov::AnyMap properties;
         // KV-cache/attention-bias Parameter name -> axis pinned to kMaxSeqLen.
         std::unordered_map<std::string, size_t> dynamic_kv_cache_axes;
@@ -169,6 +178,7 @@ private:
     GQACompiledModel(const std::shared_ptr<ov::Model>& outer_model,
                      const std::shared_ptr<const ov::IPlugin>& plugin,
                      std::shared_ptr<ov::npuw::ICompiledModel> inner_compiled_model,
+                     std::shared_ptr<ov::npuw::ICompiledModel> short_chunk_compiled_model,
                      std::unordered_map<std::string, size_t> dynamic_kv_cache_axes,
                      uint32_t effective_max_context_len,
                      uint32_t effective_sliding_window_capacity,
@@ -180,6 +190,7 @@ private:
     friend class GQAInferRequest;
 
     std::shared_ptr<ov::npuw::ICompiledModel> m_inner_compiled_model;
+    std::shared_ptr<ov::npuw::ICompiledModel> m_short_chunk_compiled_model;
     // The outer-facing model (as seen by the caller, pre-reshape-to-static). Returned
     // as-is from get_runtime_model(); callers care about the outer contract.
     std::shared_ptr<const ov::Model> m_outer_model;

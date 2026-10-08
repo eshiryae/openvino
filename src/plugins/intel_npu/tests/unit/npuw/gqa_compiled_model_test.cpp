@@ -652,6 +652,10 @@ public:
         return m_calls.front();
     }
 
+    const std::vector<CompileCall>& calls() const {
+        return m_calls;
+    }
+
 private:
     std::vector<CompileCall> m_calls;
 };
@@ -1150,6 +1154,39 @@ TEST_F(GQACompiledModelTest, ReshapesDynamicKvCacheToStaticCapacityAtAxis2) {
                std::any_of(compiled->inputs().begin(), compiled->inputs().end(), [](const auto& input) {
                    return input.get_partial_shape().is_dynamic();
                }));
+}
+
+TEST_F(GQACompiledModelTest, CompilesShortChunkModelWithStaticKvCacheAndInputIds) {
+    RecordingFactory recorder;
+    auto model = build_gqa_model_with_dynamic_kv_cache(2);
+    auto input_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{1, 4});
+    input_ids->set_friendly_name("input_ids");
+    model->add_parameters({input_ids});
+    model->add_results({std::make_shared<ov::op::v0::Result>(input_ids)});
+
+    auto compiled = create_compiled_model(model,
+                                          {{"NPUW_LLM_PREFILL_CHUNK_SIZE", uint64_t{2}},
+                                           {"NPUW_LLM_MAX_CONTEXT_LEN", uint32_t{32}}},
+                                          recorder);
+
+    ASSERT_EQ(recorder.calls().size(), 2u);
+    const auto& regular = recorder.calls()[0];
+    const auto& short_chunk = recorder.calls()[1];
+    const auto shape_of = [](const std::shared_ptr<ov::Model>& graph, const std::string& name) {
+        const auto& params = graph->get_parameters();
+        auto it = std::find_if(params.begin(), params.end(), [&](const auto& param) {
+            return param->get_friendly_name() == name;
+        });
+        OPENVINO_ASSERT(it != params.end());
+        return (*it)->get_shape();
+    };
+    EXPECT_EQ(shape_of(regular.model, "input_ids"), (ov::Shape{1, 4}));
+    EXPECT_EQ(shape_of(short_chunk.model, "input_ids"), (ov::Shape{1, 2}));
+    EXPECT_EQ(shape_of(model, "input_ids"), (ov::Shape{1, 4}));
+    EXPECT_EQ(shape_of(regular.model, "past_keys_0").at(2), 32u);
+    EXPECT_EQ(shape_of(short_chunk.model, "past_keys_0").at(2), 32u);
+    EXPECT_EQ(shape_of(short_chunk.model, "past_values_0").at(2), 32u);
+    EXPECT_EQ(short_chunk.props.count("NPUW_LLM_PREFILL_CHUNK_SIZE"), 0u);
 }
 
 TEST_F(GQACompiledModelTest, ReshapesDynamicKvCacheToStaticCapacityAtAxis3) {
