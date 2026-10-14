@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <typeinfo>
@@ -104,6 +105,15 @@ std::optional<size_t> resolve_default_sliding_window_capacity(const ov::AnyMap& 
         return static_cast<size_t>(configured);
     }
     return gqa_default_sliding_window_len_env_override();
+}
+
+// Inputs whose dim 1 is the token/sequence dimension, reshaped for the short-chunk prefill model.
+constexpr std::array<const char*, 3> kTokenDimInputNames{"input_ids", "input_hidden_states", "position_ids"};
+
+bool is_token_dim_input(const std::string& name) {
+    return std::any_of(kTokenDimInputNames.begin(), kTokenDimInputNames.end(), [&name](const char* candidate) {
+        return name == candidate;
+    });
 }
 
 void merge_config_with(ov::AnyMap& lhs, const ov::AnyMap& rhs) {
@@ -330,26 +340,41 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
 
     std::shared_ptr<ov::Model> short_chunk_model;
     const auto chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
+    std::cout << "[DEBUG] Chunk size: " << chunk_size << std::endl;
     if (stage == GQAModelStage::PREFILL && chunk_size > 0) {
-        auto input_ids = std::find_if(model->get_parameters().begin(),
-                                      model->get_parameters().end(),
-                                      [](const auto& parameter) { return parameter->get_friendly_name() == "input_ids"; });
-        if (input_ids != model->get_parameters().end()) {
-            auto ids_shape = (*input_ids)->get_partial_shape();
-            OPENVINO_ASSERT(ids_shape.rank().is_static() && ids_shape.size() >= 2,
-                            "GQA input_ids must have a static rank of at least 2 for short-chunk compilation");
-            if (ids_shape[1].is_dynamic() || static_cast<uint64_t>(ids_shape[1].get_length()) > chunk_size) {
-                short_chunk_model = model->clone();
-                if (has_dynamic_max_seq_len(short_chunk_model)) {
-                    const size_t max_seq_len = gqa_ctx_len_env_override().value_or(
-                        cfg_get<::intel_npu::NPUW_LLM_MAX_CONTEXT_LEN>(properties));
-                    ov::npuw::ReshapeToStaticGQA reshape_to_static_gqa(max_seq_len);
-                    reshape_to_static_gqa.run_on_model(short_chunk_model);
-                }
-                const auto input_index = static_cast<size_t>(std::distance(model->get_parameters().begin(), input_ids));
-                ids_shape[1] = ov::Dimension(static_cast<int64_t>(chunk_size));
-                short_chunk_model->reshape({{short_chunk_model->get_parameters()[input_index]->output(0), ids_shape}});
+        const auto& parameters = model->get_parameters();
+        std::vector<std::pair<size_t, ov::PartialShape>> token_dim_inputs;
+        bool needs_short_chunk = false;
+        for (size_t i = 0; i < parameters.size(); ++i) {
+            const auto& name = parameters[i]->get_friendly_name();
+            if (!is_token_dim_input(name)) {
+                continue;
             }
+            auto shape = parameters[i]->get_partial_shape();
+            OPENVINO_ASSERT(shape.rank().is_static() && shape.size() >= 2,
+                            "GQA input '",
+                            name,
+                            "' must have a static rank of at least 2 for short-chunk compilation");
+            needs_short_chunk = needs_short_chunk || shape[1].is_dynamic() ||
+                                static_cast<uint64_t>(shape[1].get_length()) > chunk_size;
+            shape[1] = ov::Dimension(static_cast<int64_t>(chunk_size));
+            token_dim_inputs.emplace_back(i, std::move(shape));
+        }
+        if (needs_short_chunk) {
+            short_chunk_model = model->clone();
+            short_chunk_model->set_friendly_name(short_chunk_model->get_friendly_name() + "_chunk_" +
+                                                 std::to_string(chunk_size));
+            if (has_dynamic_max_seq_len(short_chunk_model)) {
+                const size_t max_seq_len =
+                    gqa_ctx_len_env_override().value_or(cfg_get<::intel_npu::NPUW_LLM_MAX_CONTEXT_LEN>(properties));
+                ov::npuw::ReshapeToStaticGQA reshape_to_static_gqa(max_seq_len);
+                reshape_to_static_gqa.run_on_model(short_chunk_model);
+            }
+            std::map<ov::Output<ov::Node>, ov::PartialShape> new_shapes;
+            for (const auto& [index, shape] : token_dim_inputs) {
+                new_shapes.emplace(short_chunk_model->get_parameters()[index]->output(0), shape);
+            }
+            short_chunk_model->reshape(new_shapes);
         }
     }
 
@@ -891,23 +916,30 @@ void ov::npuw::GQAInferRequest::select_inner_request_locked() const {
     ensure_inner_request_locked();
     auto selected_request = m_regular_inner_request;
     if (m_compiled_model->m_short_chunk_compiled_model) {
-        const auto ids_it = m_user_input_tensors.find("input_ids");
-        if (ids_it != m_user_input_tensors.end()) {
-            const auto& ids_shape = ids_it->second->get_shape();
-            const auto& short_inputs = m_compiled_model->m_short_chunk_compiled_model->inputs();
-            auto short_ids = std::find_if(short_inputs.begin(), short_inputs.end(), [](const auto& input) {
-                return input.get_node()->get_friendly_name() == "input_ids";
+        const auto& short_inputs = m_compiled_model->m_short_chunk_compiled_model->inputs();
+        for (const auto* token_input_name : kTokenDimInputNames) {
+            const auto user_it = m_user_input_tensors.find(token_input_name);
+            if (user_it == m_user_input_tensors.end()) {
+                continue;
+            }
+            auto short_it = std::find_if(short_inputs.begin(), short_inputs.end(), [&](const auto& input) {
+                return input.get_node()->get_friendly_name() == token_input_name;
             });
-            if (short_ids != short_inputs.end() && ids_shape.size() > 1 &&
-                (*short_ids).get_partial_shape().rank().is_static() &&
-                (*short_ids).get_partial_shape().size() > 1 && (*short_ids).get_partial_shape()[1].is_static() &&
-                ids_shape[1] == static_cast<size_t>((*short_ids).get_partial_shape()[1].get_length())) {
+            if (short_it == short_inputs.end()) {
+                continue;
+            }
+            const auto& user_shape = user_it->second->get_shape();
+            const auto& short_shape = short_it->get_partial_shape();
+            if (user_shape.size() > 1 && short_shape.rank().is_static() && short_shape.size() > 1 &&
+                short_shape[1].is_static() &&
+                user_shape[1] == static_cast<size_t>(short_shape[1].get_length())) {
                 if (m_short_chunk_inner_request == nullptr) {
                     m_short_chunk_inner_request =
                         create_inner_request_locked(m_compiled_model->m_short_chunk_compiled_model);
                 }
                 selected_request = m_short_chunk_inner_request;
             }
+            break;
         }
     }
     if (selected_request == m_inner_request) {
@@ -1310,7 +1342,7 @@ void ov::npuw::GQAInferRequest::set_tensor(const ov::Output<const ov::Node>& por
     auto it = dynamic_axes.find(name);
     if (it == dynamic_axes.end()) {
         m_user_input_tensors[name] = tensor;
-        if (name == "input_ids") {
+        if (is_token_dim_input(name)) {
             select_inner_request_locked();
         }
         GQA_TRACE("    -> not a dynamic-axis input, forwarding to selected inner request");
