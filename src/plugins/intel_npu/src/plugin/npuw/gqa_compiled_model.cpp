@@ -109,11 +109,26 @@ std::optional<size_t> resolve_default_sliding_window_capacity(const ov::AnyMap& 
 
 // Inputs whose dim 1 is the token/sequence dimension, reshaped for the short-chunk prefill model.
 constexpr std::array<const char*, 3> kTokenDimInputNames{"input_ids", "input_hidden_states", "position_ids"};
+constexpr std::array<const char*, 3> kCandidateNames{"seqlens_k", "past_seq_len", "total_seq_len"};
 
 bool is_token_dim_input(const std::string& name) {
     return std::any_of(kTokenDimInputNames.begin(), kTokenDimInputNames.end(), [&name](const char* candidate) {
         return name == candidate;
     });
+}
+
+ov::SoPtr<ov::ITensor> make_short_chunk_hidden_states_view(const ov::SoPtr<ov::ITensor>& tensor, size_t chunk_size) {
+    const auto& shape = tensor->get_shape();
+    OPENVINO_ASSERT(shape.size() == 3, "GQA input_hidden_states must have rank 3 for short-chunk inference");
+    OPENVINO_ASSERT(shape[1] >= chunk_size,
+                    "GQA input_hidden_states sequence length ",
+                    shape[1],
+                    " is shorter than the configured short chunk size ",
+                    chunk_size);
+    ov::Coordinate begin(shape.size(), 0);
+    auto end = ov::Coordinate(shape);
+    end[1] = chunk_size;
+    return ov::SoPtr<ov::ITensor>(ov::make_tensor(tensor._ptr, begin, end));
 }
 
 void merge_config_with(ov::AnyMap& lhs, const ov::AnyMap& rhs) {
@@ -303,6 +318,8 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
                                                                  : "unknown") +
                              std::to_string(mcount++));
 
+    std::cout << "Preparing GQA model with stage: " << (stage == GQAModelStage::PREFILL ? "prefill" : stage == GQAModelStage::GENERATE ? "generate" : "unknown") << " and model count: " << mcount << std::endl;
+
     // Untangle shared scale constants so every DequantizeLinear Multiply
     // gets its own copy.  Some exporters reuse a single scale node across
     // multiple layers; NPUW's FOLD pass requires per-instance scalars.
@@ -339,8 +356,12 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
     }
 
     std::shared_ptr<ov::Model> short_chunk_model;
-    const auto chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
-    std::cout << "[DEBUG] Chunk size: " << chunk_size << std::endl;
+    uint64_t chunk_size = 0;
+    if (properties.count(std::string(::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE::key()))) {
+        chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
+    }
+    // const auto chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
+    std::cout << "[DEBUG] Chunk size set: " << chunk_size << std::endl;
     if (stage == GQAModelStage::PREFILL && chunk_size > 0) {
         const auto& parameters = model->get_parameters();
         std::vector<std::pair<size_t, ov::PartialShape>> token_dim_inputs;
@@ -362,6 +383,7 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
         }
         if (needs_short_chunk) {
             short_chunk_model = model->clone();
+            ov::save_model(model, "ov_npuw_original_model.xml");
             short_chunk_model->set_friendly_name(short_chunk_model->get_friendly_name() + "_chunk_" +
                                                  std::to_string(chunk_size));
             if (has_dynamic_max_seq_len(short_chunk_model)) {
@@ -375,6 +397,7 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
                 new_shapes.emplace(short_chunk_model->get_parameters()[index]->output(0), shape);
             }
             short_chunk_model->reshape(new_shapes);
+            ov::save_model(short_chunk_model, "ov_npuw_short_chunk_model.xml");
         }
     }
 
@@ -382,6 +405,7 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
             compiled_model,
             short_chunk_model
             std::move(prepared_properties),
+            chunk_size
             std::move(dynamic_kv_cache_axes),
             effective_max_context_len,
             effective_sliding_window_capacity};
@@ -610,6 +634,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(PreparedState prepared,
                                              CompiledModelFactory factory)
     : ov::npuw::ICompiledModel(prepared.model, plugin),
       m_inner_compiled_model(factory(prepared.compiled_model, plugin, prepared.properties)),
+      m_short_chunk_size(prepared.short_chunk_size),
       m_outer_model(prepared.model),
       m_dynamic_kv_cache_axes(std::move(prepared.dynamic_kv_cache_axes)),
       m_effective_max_context_len(prepared.effective_max_context_len),
@@ -631,6 +656,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(const std::shared_ptr<ov::Model>& o
                                              const std::shared_ptr<const ov::IPlugin>& plugin,
                                              std::shared_ptr<ov::npuw::ICompiledModel> inner_compiled_model,
                                              std::shared_ptr<ov::npuw::ICompiledModel> short_chunk_compiled_model,
+                                             uint64_t short_chunk_size,
                                              std::unordered_map<std::string, size_t> dynamic_kv_cache_axes,
                                              uint32_t effective_max_context_len,
                                              uint32_t effective_sliding_window_capacity,
@@ -638,6 +664,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(const std::shared_ptr<ov::Model>& o
                                              std::unordered_map<std::string, std::string> present_to_past_param_names)
     : ov::npuw::ICompiledModel(outer_model, plugin),
       m_inner_compiled_model(std::move(inner_compiled_model)),
+            m_short_chunk_size(short_chunk_size),
       m_outer_model(outer_model),
       m_dynamic_kv_cache_axes(std::move(dynamic_kv_cache_axes)),
       m_effective_max_context_len(effective_max_context_len),
@@ -785,6 +812,7 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
     uint32_t effective_sliding_window_capacity = 0;
     std::optional<std::string> total_seq_len_param_name;
     std::unordered_map<std::string, std::string> present_to_past_param_names;
+    const auto short_chunk_size = cfg_get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>(properties);
     outer_parameters = GQACompiledModel::read_input_port_list(stream);
     outer_results = GQACompiledModel::read_output_port_list(stream);
     read(stream, dynamic_kv_cache_axes);
@@ -828,6 +856,7 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
                                                                   plugin,
                                                                   std::move(inner_compiled_model),
                                                                   std::move(short_chunk_compiled_model),
+                                                                  short_chunk_size,
                                                                   std::move(dynamic_kv_cache_axes),
                                                                   effective_max_context_len,
                                                                   effective_sliding_window_capacity,
@@ -915,33 +944,23 @@ std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::GQAInferRequest::create_inner_
 void ov::npuw::GQAInferRequest::select_inner_request_locked() const {
     ensure_inner_request_locked();
     auto selected_request = m_regular_inner_request;
-    if (m_compiled_model->m_short_chunk_compiled_model) {
-        const auto& short_inputs = m_compiled_model->m_short_chunk_compiled_model->inputs();
-        for (const auto* token_input_name : kTokenDimInputNames) {
-            const auto user_it = m_user_input_tensors.find(token_input_name);
-            if (user_it == m_user_input_tensors.end()) {
-                continue;
-            }
-            auto short_it = std::find_if(short_inputs.begin(), short_inputs.end(), [&](const auto& input) {
-                return input.get_node()->get_friendly_name() == token_input_name;
-            });
-            if (short_it == short_inputs.end()) {
-                continue;
-            }
-            const auto& user_shape = user_it->second->get_shape();
-            const auto& short_shape = short_it->get_partial_shape();
-            if (user_shape.size() > 1 && short_shape.rank().is_static() && short_shape.size() > 1 &&
-                short_shape[1].is_static() &&
-                user_shape[1] == static_cast<size_t>(short_shape[1].get_length())) {
+    if (m_compiled_model->m_short_chunk_compiled_model && m_compiled_model->m_short_chunk_size > 0) {
+        const auto total_seq_len_it = m_user_input_tensors.find("total_seq_len");
+        if (total_seq_len_it != m_user_input_tensors.end()) {
+            const auto total_seq_len = ov::npuw::read_scalar_int_tensor(total_seq_len_it->second);
+            if (total_seq_len && *total_seq_len >= 0 &&
+                static_cast<uint64_t>(*total_seq_len) % m_compiled_model->m_short_chunk_size != 0) {
                 if (m_short_chunk_inner_request == nullptr) {
                     m_short_chunk_inner_request =
                         create_inner_request_locked(m_compiled_model->m_short_chunk_compiled_model);
                 }
+                GQA_TRACE("select_inner_request_locked(): created short chunk inner request @ "
+                          << m_short_chunk_inner_request.get());
                 selected_request = m_short_chunk_inner_request;
             }
-            break;
         }
     }
+
     if (selected_request == m_inner_request) {
         return;
     }
@@ -957,7 +976,11 @@ void ov::npuw::GQAInferRequest::select_inner_request_locked() const {
         }
         auto tensor_it = m_user_input_tensors.find(name);
         if (tensor_it != m_user_input_tensors.end()) {
-            m_inner_request->set_tensor(inner_inputs[i], tensor_it->second);
+            auto tensor = tensor_it->second;
+            if (name == "input_hidden_states" && m_inner_request == m_short_chunk_inner_request) {
+                tensor = make_short_chunk_hidden_states_view(tensor, m_compiled_model->m_short_chunk_size);
+            }
+            m_inner_request->set_tensor(inner_inputs[i], tensor);
         }
     }
 
@@ -1013,7 +1036,6 @@ void ov::npuw::GQAInferRequest::trace_sequence_length_inputs_locked() const {
     if (!gqa_trace_enabled()) {
         return;
     }
-    static constexpr std::array<const char*, 3> kCandidateNames{"seqlens_k", "past_seq_len", "total_seq_len"};
     const auto& outer_inputs = m_compiled_model->inputs();
     for (const auto* candidate : kCandidateNames) {
         auto it = std::find_if(outer_inputs.begin(), outer_inputs.end(), [&](const auto& input) {
@@ -1342,11 +1364,17 @@ void ov::npuw::GQAInferRequest::set_tensor(const ov::Output<const ov::Node>& por
     auto it = dynamic_axes.find(name);
     if (it == dynamic_axes.end()) {
         m_user_input_tensors[name] = tensor;
-        if (is_token_dim_input(name)) {
+        if (is_token_dim_input(name) || name == "total_seq_len") {
             select_inner_request_locked();
         }
+        
+        auto inner_tensor = tensor;
+        if (name == "input_hidden_states" && m_inner_request == m_short_chunk_inner_request) {
+            inner_tensor = make_short_chunk_hidden_states_view(tensor, m_compiled_model->m_short_chunk_size);
+        }
+        m_inner_request->set_tensor(map_port_locked(port), inner_tensor);
+
         GQA_TRACE("    -> not a dynamic-axis input, forwarding to selected inner request");
-        m_inner_request->set_tensor(map_port_locked(port), tensor);
         return;
     }
 

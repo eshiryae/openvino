@@ -153,6 +153,7 @@ private:
         std::shared_ptr<ov::Model> compiled_model;
         std::shared_ptr<ov::Model> short_chunk_model;
         ov::AnyMap properties;
+        uint64_t short_chunk_size = 0;
         // KV-cache/attention-bias Parameter name -> axis pinned to kMaxSeqLen.
         std::unordered_map<std::string, size_t> dynamic_kv_cache_axes;
         // Static KV-cache capacity actually used to reshape the model; stripped from the
@@ -179,6 +180,7 @@ private:
                      const std::shared_ptr<const ov::IPlugin>& plugin,
                      std::shared_ptr<ov::npuw::ICompiledModel> inner_compiled_model,
                      std::shared_ptr<ov::npuw::ICompiledModel> short_chunk_compiled_model,
+                     uint64_t short_chunk_size,
                      std::unordered_map<std::string, size_t> dynamic_kv_cache_axes,
                      uint32_t effective_max_context_len,
                      uint32_t effective_sliding_window_capacity,
@@ -191,6 +193,7 @@ private:
 
     std::shared_ptr<ov::npuw::ICompiledModel> m_inner_compiled_model;
     std::shared_ptr<ov::npuw::ICompiledModel> m_short_chunk_compiled_model;
+    uint64_t m_short_chunk_size = 0;
     // The outer-facing model (as seen by the caller, pre-reshape-to-static). Returned
     // as-is from get_runtime_model(); callers care about the outer contract.
     std::shared_ptr<const ov::Model> m_outer_model;
